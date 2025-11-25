@@ -1,0 +1,32 @@
+services:
+  - type: web
+    name: bingo-backend
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3000
+      - key: MONGODB_URI
+        fromDatabase:
+          name: bingo-mongodb
+          property: connectionString
+      - key: JWT_SECRET
+        generateValue: true
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_BOT_USERNAME
+        sync: false
+      - key: TELEGRAM_APP_ID
+        sync: false
+      - key: CLIENT_URL
+        value: https://your-frontend-app.onrender.com
+
+databases:
+  - name: bingo-mongodb
+    plan: free
+    databaseName: bingo
+    ipAllowList: []
