@@ -238,4 +238,261 @@ io.on('connection', (socket) => {
     socket.join(gameId);
 
     // Send available cards to the player
-    socket.emit('card-pool
+    socket.emit('card-pool', {
+      cards: gameRoom.cardPool.map((card, index) => ({
+        id: index,
+        preview: getCardPreview(card)
+      }))
+    });
+
+    socket.emit('game-joined', {
+      game: {
+        id: gameRoom.id,
+        host: gameRoom.host,
+        isGameActive: gameRoom.isGameActive,
+        calledNumbers: gameRoom.calledNumbers,
+        players: Array.from(gameRoom.players.values()).map(p => ({
+          id: p.id, name: p.name, isHost: p.isHost, hasSelectedCard: p.hasSelectedCard
+        }))
+      },
+      player: { id: player.id, name: player.name, isHost: player.isHost }
+    });
+
+    socket.to(gameId).emit('player-joined', {
+      player: { id: player.id, name: player.name, isHost: player.isHost, hasSelectedCard: false },
+      players: Array.from(gameRoom.players.values()).map(p => ({
+        id: p.id, name: p.name, isHost: p.isHost, hasSelectedCard: p.hasSelectedCard
+      }))
+    });
+  }
+
+  // Player selects a card from the pool
+  socket.on('select-card', (data) => {
+    const { gameId, cardId } = data;
+    const connection = playerConnections.get(socket.id);
+    const gameRoom = gameRooms.get(gameId);
+    const player = gameRoom?.players.get(connection.playerId);
+
+    if (player && gameRoom && !player.hasSelectedCard) {
+      if (cardId >= 0 && cardId < gameRoom.cardPool.length) {
+        player.card = gameRoom.cardPool[cardId];
+        player.hasSelectedCard = true;
+
+        socket.emit('card-selected', {
+          card: player.card,
+          success: true
+        });
+
+        socket.to(gameId).emit('player-card-selected', {
+          playerId: player.id,
+          playerName: player.name
+        });
+
+        // Check if all players have selected cards and game can start
+        checkAllPlayersReady(gameRoom);
+      } else {
+        socket.emit('error', { message: 'Invalid card selection' });
+      }
+    }
+  });
+
+  // Player claims Bingo
+  socket.on('claim-bingo', (data) => {
+    const { gameId } = data;
+    const connection = playerConnections.get(socket.id);
+    const gameRoom = gameRooms.get(gameId);
+    const player = gameRoom?.players.get(connection.playerId);
+
+    if (!player || !gameRoom?.isGameActive) {
+      socket.emit('error', { message: 'Cannot claim Bingo now' });
+      return;
+    }
+
+    if (player.hasClaimedBingo) {
+      socket.emit('error', { message: 'You have already claimed Bingo' });
+      return;
+    }
+
+    // Validate the claim
+    if (checkWinCondition(player.markedCells)) {
+      player.hasClaimedBingo = true;
+      gameRoom.bingoClaims.set(player.id, {
+        playerId: player.id,
+        playerName: player.name,
+        timestamp: Date.now(),
+        markedCells: Array.from(player.markedCells),
+        winningPattern: getWinningPattern(player.markedCells)
+      });
+
+      // Notify all players about the Bingo claim
+      io.to(gameId).emit('bingo-claimed', {
+        playerId: player.id,
+        playerName: player.name,
+        timestamp: Date.now()
+      });
+
+      console.log(`Player ${player.name} claimed Bingo in game ${gameId}`);
+    } else {
+      socket.emit('error', { message: 'No valid Bingo pattern found!' });
+    }
+  });
+
+  // Host verifies Bingo claim
+  socket.on('verify-bingo', (data) => {
+    const { gameId, playerId, isValid } = data;
+    const connection = playerConnections.get(socket.id);
+    const gameRoom = gameRooms.get(gameId);
+
+    if (!gameRoom || gameRoom.host !== connection.playerId) {
+      socket.emit('error', { message: 'Only host can verify Bingo' });
+      return;
+    }
+
+    const claim = gameRoom.bingoClaims.get(playerId);
+    if (!claim) {
+      socket.emit('error', { message: 'No Bingo claim found for this player' });
+      return;
+    }
+
+    if (isValid) {
+      // Player wins!
+      gameRoom.isGameActive = false;
+      gameRoom.winner = playerId;
+      gameRoom.finishedAt = Date.now();
+
+      io.to(gameId).emit('bingo-verified', {
+        winner: {
+          id: claim.playerId,
+          name: claim.playerName,
+          markedCells: claim.markedCells,
+          winningPattern: claim.winningPattern
+        },
+        isValid: true,
+        message: `${claim.playerName} wins with a valid Bingo!`
+      });
+
+      console.log(`Bingo verified for ${claim.playerName} in game ${gameId}`);
+    } else {
+      // Invalid claim
+      gameRoom.bingoClaims.delete(playerId);
+      const player = gameRoom.players.get(playerId);
+      if (player) player.hasClaimedBingo = false;
+
+      io.to(gameId).emit('bingo-verified', {
+        winner: null,
+        isValid: false,
+        message: `${claim.playerName}'s Bingo claim was invalid`
+      });
+    }
+  });
+
+  socket.on('start-game', (data) => {
+    const { gameId } = data;
+    const connection = playerConnections.get(socket.id);
+    const gameRoom = gameRooms.get(gameId);
+    
+    if (gameRoom && gameRoom.host === connection.playerId) {
+      gameRoom.isGameActive = true;
+      startNumberCalling(gameId);
+      io.to(gameId).emit('game-started', { startedAt: Date.now() });
+    }
+  });
+
+  socket.on('mark-cell', (data) => {
+    const { gameId, cellIndex } = data;
+    const connection = playerConnections.get(socket.id);
+    const gameRoom = gameRooms.get(gameId);
+    const player = gameRoom?.players.get(connection.playerId);
+
+    if (player && gameRoom?.isGameActive && player.hasSelectedCard) {
+      const cell = player.card.find(c => c.index === cellIndex);
+      if (cell && !cell.isFree && gameRoom.calledNumbers.includes(cell.number)) {
+        player.markedCells.add(cellIndex);
+        
+        socket.emit('cell-marked', { cellIndex });
+        socket.to(gameId).emit('player-marked-cell', {
+          playerId: player.id, markedCount: player.markedCells.size
+        });
+      }
+    }
+  });
+
+  socket.on('send-chat', (data) => {
+    const { gameId, message } = data;
+    const connection = playerConnections.get(socket.id);
+    const gameRoom = gameRooms.get(gameId);
+    const player = gameRoom?.players.get(connection.playerId);
+
+    if (player) {
+      io.to(gameId).emit('chat-message', {
+        playerId: player.id, playerName: player.name, message, timestamp: Date.now()
+      });
+    }
+  });
+
+  socket.on('disconnect', () => {
+    const connection = playerConnections.get(socket.id);
+    if (connection) {
+      const { gameId, playerId } = connection;
+      const gameRoom = gameRooms.get(gameId);
+      
+      if (gameRoom) {
+        gameRoom.players.delete(playerId);
+        socket.to(gameId).emit('player-left', { playerId });
+        
+        if (gameRoom.players.size === 0) {
+          gameRooms.delete(gameId);
+          cardPools.delete(gameId);
+        }
+      }
+      playerConnections.delete(socket.id);
+    }
+  });
+
+  function startNumberCalling(gameId) {
+    const gameRoom = gameRooms.get(gameId);
+    if (!gameRoom) return;
+
+    const interval = setInterval(() => {
+      if (gameRoom.isGameActive && gameRoom.calledNumbers.length < 75) {
+        let number;
+        do {
+          number = Math.floor(Math.random() * 75) + 1;
+        } while (gameRoom.calledNumbers.includes(number));
+
+        gameRoom.calledNumbers.push(number);
+        io.to(gameId).emit('number-called', {
+          number, totalCalled: gameRoom.calledNumbers.length
+        });
+      } else {
+        clearInterval(interval);
+      }
+    }, 3000);
+  }
+
+  function getCardPreview(card) {
+    // Create a preview showing first few numbers from each column
+    const preview = {
+      B: card.filter(c => c.col === 0 && !c.isFree).slice(0, 2).map(c => c.number),
+      I: card.filter(c => c.col === 1 && !c.isFree).slice(0, 2).map(c => c.number),
+      N: card.filter(c => c.col === 2 && !c.isFree).slice(0, 2).map(c => c.number),
+      G: card.filter(c => c.col === 3 && !c.isFree).slice(0, 2).map(c => c.number),
+      O: card.filter(c => c.col === 4 && !c.isFree).slice(0, 2).map(c => c.number)
+    };
+    return preview;
+  }
+
+  function checkAllPlayersReady(gameRoom) {
+    const allPlayersReady = Array.from(gameRoom.players.values())
+      .every(player => player.hasSelectedCard);
+    
+    if (allPlayersReady) {
+      io.to(gameRoom.id).emit('all-players-ready');
+    }
+  }
+});
+
+const PORT = process.env.PORT || 3001;
+server.listen(PORT, () => {
+  console.log(`Bingo backend running on port ${PORT}`);
+});
